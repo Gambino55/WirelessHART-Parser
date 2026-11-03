@@ -33,6 +33,32 @@ local eui64 = { [0] = "no", "yes" }
 local priority = { [0] = "alarm", "normal", "process data", "command" }
 local netkey = { [0] = "false", "true" }
 local pkttype = { [0] = "ack", "advertise", "keep alive", "disconnect", [7] = "data" }
+-- Well-known WirelessHART nicknames
+local nickname = { [0xF980] = "Network Manager", [0xF981] = "Gateway" }
+
+-- Channel map: little-endian bitmap, bit 0 = channel 11 ... bit 14 = channel 25
+-- (bit 15 would be channel 26, which WirelessHART does not use). Inferred from
+-- captures: all 15 channels reads ff7f; channels 13-21 only reads fc07.
+-- Returns e.g. "13-21" or "11-13, 15, 17-25".
+local function channel_list(tvb, off, n)
+    local chans = {}
+    for i = 0, n - 1 do
+        local b = tvb(off + i, 1):uint()
+        for bit = 0, 7 do
+            if bits(b, bit, 1) == 1 then chans[#chans + 1] = 11 + i * 8 + bit end
+        end
+    end
+    if #chans == 0 then return "none" end
+    local parts, first = {}, 1
+    for i = 1, #chans do
+        if i == #chans or chans[i + 1] ~= chans[i] + 1 then
+            parts[#parts + 1] = (i == first) and tostring(chans[i])
+                or (chans[first] .. "-" .. chans[i])
+            first = i + 1
+        end
+    end
+    return table.concat(parts, ", ")
+end
 
 f.dlpduspec            = ProtoField.uint8("wihart.dlpduspec", "DLPDU specifier", base.HEX)
 f.dlpduspec_priority   = ProtoField.uint8("wihart.dlpduspec.priority", "priority", base.HEX, priority, 0x30)
@@ -72,9 +98,9 @@ f.nwk_control_src64    = ProtoField.uint8("wihart.nwk.control.src64", "src64", b
 f.nwk_ttl              = ProtoField.uint8("wihart.nwk.ttl", "time to live hop count", base.DEC)
 f.nwk_asn              = ProtoField.uint16("wihart.nwk.asn", "snippet of abs slot number", base.HEX)
 f.nwk_graphid          = ProtoField.uint16("wihart.nwk.graphid", "graph id", base.HEX)
-f.nwk_dstaddr          = ProtoField.uint16("wihart.nwk.dstaddr", "dstaddr", base.HEX)
+f.nwk_dstaddr          = ProtoField.uint16("wihart.nwk.dstaddr", "dstaddr", base.HEX, nickname)
 f.nwk_dstaddr64        = ProtoField.uint64("wihart.nwk.dstaddr64", "dstaddr", base.HEX)
-f.nwk_srcaddr          = ProtoField.uint16("wihart.nwk.srcaddr", "srcaddr", base.HEX)
+f.nwk_srcaddr          = ProtoField.uint16("wihart.nwk.srcaddr", "srcaddr", base.HEX, nickname)
 f.nwk_srcaddr64        = ProtoField.uint64("wihart.nwk.srcaddr64", "srcaddr", base.HEX)
 
 -- Length of an advertise body starting at `off`, or nil if it does not fit
@@ -161,7 +187,10 @@ function wihart.dissector(tvb, pinfo, tree)
         add(advtree, f.adv_joinctl, 1)
         local mapsz = math.ceil(tvb(pos, 1):uint() / 8)
         add(advtree, f.adv_mapsz, 1)
-        add(advtree, f.adv_map, mapsz)
+        local mapitem = add(advtree, f.adv_map, mapsz)
+        if mapsz > 0 then
+            mapitem:append_text(" (channels " .. channel_list(tvb, pos - mapsz, mapsz) .. ")")
+        end
         add(advtree, f.adv_graphid, 2)
         local framecnt = tvb(pos, 1):uint()
         add(advtree, f.adv_framecnt, 1)

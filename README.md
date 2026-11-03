@@ -8,9 +8,11 @@ number, network ID, addresses, FCS). This plugin decodes the WirelessHART
 layer on top of it:
 
 - DLPDU specifier (priority, network-key flag, packet type) and MIC
-- Advertise (absolute slot number, join control, channel map, superframes and join links)
+- Advertise (absolute slot number, join control, channel map shown as the
+  list of active channels, e.g. "13-21", superframes and join links)
 - Ack (response code, time adjustment)
 - Data: network-layer (NPDU) header — TTL, ASN snippet, graph ID, addresses
+  (0xF980 and 0xF981 labelled Network Manager and Gateway)
 
 ## Installation
 
