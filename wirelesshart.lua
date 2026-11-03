@@ -1,58 +1,42 @@
--- wihart dissector
--- this was taken from Sam Roberts post on the wireshark-dev list
--- https://www.wireshark.org/lists/wireshark-dev/201107/msg00040.html
---[[
-TODO:
+-- WirelessHART (IEC 62591) dissector for Wireshark.
+--
+-- Originally from Sam Roberts' post on wireshark-dev
+-- (https://www.wireshark.org/lists/wireshark-dev/201107/msg00040.html),
+-- packaged by Reid Wightman.
+--
+-- WirelessHART frames are IEEE 802.15.4 frames. Wireshark's built-in
+-- 802.15.4 ("wpan") dissector decodes the MAC header (sequence number,
+-- network ID, addresses) and the FCS when present; this plugin decodes what wpan
+-- hands over as payload:
+--
+--   [DLPDU specifier (1)] [DLPDU payload (n)] [MIC (4)]
+--
+-- so it works with any standard 802.15.4 sniffer (link types 195, 230, 283).
+--
+-- Byte order: the 802.15.4 header is little-endian (handled by wpan); the
+-- WirelessHART fields below are big-endian.
 
-- decode next level
-- grok the protocol flow
-- version
+local wihart = Proto("wihart", "WirelessHART")
 
-- libnet bugfix
+local MIC_LEN = 4
+local NPDU_MIN = 10 -- control, ttl, asn(2), graph id(2), dst(2), src(2)
 
-OPTIONAL:
-
-- new column for msg type
-
-]]
-
-local wihart = Proto("wihart", "Wireless HART")
-
-local floor = math.floor
-local function bxor (a,b)
-    local r = 0
-    for i = 0, 31 do
-        local x = a / 2 + b / 2
-        if x ~= floor (x) then
-            r = r + 2^i
-        end
-        a = floor (a / 2)
-        b = floor (b / 2)
-    end
-    return r
+-- Bit extraction without the `&` operator, so the plugin loads on both
+-- Lua 5.2 (Wireshark <= 4.2) and Lua 5.4 (Wireshark >= 4.4).
+local function bits(v, shift, width)
+    return math.floor(v / 2^shift % 2^width)
 end
-local function band (a,b) return ((a+b) - bxor(a,b))/2 end
 
 local f = wihart.fields
 
-local eui64 = {[0x0]="no", "yes"}
+local eui64 = { [0] = "no", "yes" }
 local priority = { [0] = "alarm", "normal", "process data", "command" }
 local netkey = { [0] = "false", "true" }
 local pkttype = { [0] = "ack", "advertise", "keep alive", "disconnect", [7] = "data" }
 
-f.fortyone             = ProtoField.uint8("wihart.fortyone", "fortyone", base.HEX)
-f.addrspec_b7          = ProtoField.uint8("wihart.addrspec.b7", "bit7", base.DEC, nil, 0x80) -- always 1
-f.addrspec_b3          = ProtoField.uint8("wihart.addrspec.b3", "bit3", base.DEC, nil, 0x08) -- always 1
-f.addrspec_dst64       = ProtoField.uint8("wihart.addrspec.dst64", "dst64", base.DEC, eui64, 0x40)
-f.addrspec_src64       = ProtoField.uint8("wihart.addrspec.src64", "src64", base.DEC, eui64, 0x04)
-f.seqno                = ProtoField.uint8("wihart.seqno", "seqno", base.DEC)
-f.netid                = ProtoField.uint16("wihart.netid", "netid", base.HEX)
-f.dstaddr              = ProtoField.uint16("wihart.dstaddr", "dstaddr", base.HEX)
-f.dstaddr64            = ProtoField.uint64("wihart.dstaddr64", "dstaddr", base.HEX)
-f.srcaddr              = ProtoField.uint16("wihart.srcaddr", "srcaddr", base.HEX)
-f.srcaddr64            = ProtoField.uint64("wihart.srcaddr64", "srcaddr", base.HEX)
-f.dlpduspec_priority   = ProtoField.uint8( "wihart.dlpduspec.priority", "priority", base.HEX, priority, 0x30)
-f.dlpduspec_netkey     = ProtoField.uint8( "wihart.dlpduspec.netkey", "network key", base.DEC, netkey, 0x8)
+f.dlpduspec            = ProtoField.uint8("wihart.dlpduspec", "DLPDU specifier", base.HEX)
+f.dlpduspec_priority   = ProtoField.uint8("wihart.dlpduspec.priority", "priority", base.HEX, priority, 0x30)
+f.dlpduspec_netkey     = ProtoField.uint8("wihart.dlpduspec.netkey", "network key", base.DEC, netkey, 0x08)
 f.dlpduspec_type       = ProtoField.uint8("wihart.dlpduspec.pkttype", "packet type", base.HEX, pkttype, 0x07)
 f.dlpdudata            = ProtoField.bytes("wihart.dlpdudata", "dlpdudata")
 f.mic                  = ProtoField.uint32("wihart.mic", "message integrity code", base.HEX)
@@ -93,142 +77,136 @@ f.nwk_dstaddr64        = ProtoField.uint64("wihart.nwk.dstaddr64", "dstaddr", ba
 f.nwk_srcaddr          = ProtoField.uint16("wihart.nwk.srcaddr", "srcaddr", base.HEX)
 f.nwk_srcaddr64        = ProtoField.uint64("wihart.nwk.srcaddr64", "srcaddr", base.HEX)
 
-local addr64
+-- Length of an advertise body starting at `off`, or nil if it does not fit
+-- in `avail` bytes.
+local function advertise_len(tvb, off, avail)
+    local p = off
+    local function fits(n) return p + n <= off + avail end
+    if not fits(7) then return nil end
+    p = p + 6 -- absolute slot number (5) + join control (1)
+    local mapsz = math.ceil(tvb(p, 1):uint() / 8)
+    p = p + 1
+    if not fits(mapsz + 3) then return nil end
+    p = p + mapsz + 2 -- channel map + graph id
+    local nframes = tvb(p, 1):uint()
+    p = p + 1
+    for _ = 1, nframes do
+        if not fits(4) then return nil end
+        local nlinks = tvb(p + 3, 1):uint()
+        p = p + 4 -- superframe id (1) + slots (2) + link count (1)
+        if not fits(nlinks * 3) then return nil end
+        p = p + nlinks * 3
+    end
+    return p - off
+end
 
-function wihart.dissector(buffer, pinfo, tree)
+-- Structural check used by the heuristic: does this 802.15.4 payload have
+-- the exact shape of a WirelessHART DLPDU?
+local function looks_like_wihart(tvb)
+    local len = tvb:len()
+    if len < 1 + MIC_LEN then return false end
+    local spec = tvb(0, 1):uint()
+    if bits(spec, 6, 2) ~= 0 then return false end -- reserved bits
+    local name = pkttype[bits(spec, 0, 3)]
+    local body = len - 1 - MIC_LEN
+    if name == "ack" then return body == 3 end
+    if name == "keep alive" or name == "disconnect" then return body == 0 end
+    if name == "advertise" then return advertise_len(tvb, 1, body) == body end
+    if name == "data" then
+        if body < NPDU_MIN then return false end
+        local control = tvb(1, 1):uint()
+        local need = NPDU_MIN + 6 * bits(control, 7, 1) + 6 * bits(control, 6, 1)
+        return body >= need
+    end
+    return false
+end
+
+function wihart.dissector(tvb, pinfo, tree)
+    local len = tvb:len()
+    if len < 1 + MIC_LEN then return 0 end
+
     pinfo.cols.protocol = "WiHART"
 
-    if buffer(0,1):uint() ~= 0x41 then
-        -- I'ts not wihart, I think we were getting ZigBee beacon requests,
-        -- dissection will fail, so stop with this.
-        pinfo.cols.protocol = "UNKNOWN"
-        return
-    end
-
-    local subtree = tree:add(wihart, buffer(), "WiHART DLPDU")
-    subtree:add(f.fortyone, buffer(0,1))
-
-    local addrtree = subtree:add(wihart, buffer(1,1), string.format("addrspec: 0x%x", buffer(1,1):uint()))
-    local addrspec = buffer(1,1):uint()
-    addrtree:add(f.addrspec_b7, buffer(1,1))
-    addrtree:add(f.addrspec_dst64, buffer(1,1))
-    addrtree:add(f.addrspec_b3, buffer(1,1))
-    addrtree:add(f.addrspec_src64, buffer(1,1))
-
-    subtree:add(f.seqno, buffer(2,1))
-    subtree:add(f.netid, buffer(3,2))
-
-    local pos = 5
-    local function doaddr(kind, mask, prefix, tree)
-        -- print(kind, mask, prefix)
-        tree = tree or subtree
-        prefix = prefix or ""
-        local b
-        if band(addrspec, mask) == mask then
-            b = buffer(pos,8)
-            tree:add(f[prefix..kind.."addr64"], b)
-            if not addr64 then -- FIXME
-                addr64 = b:uint64()
-            end
-        else
-            b = buffer(pos,2)
-            tree:add(f[prefix..kind.."addr"], b)
-        end
-        pinfo.cols[kind] = tostring(b)
-        pos = pos + b:len()
-    end
-    doaddr("dst", 0x40)
-    doaddr("src", 0x04)
-
-    print("============> addr64", addr64)
-
-    local b = buffer(pos,1)
-    pos = pos + 1
-    local pkttree = subtree:add(wihart, b, string.format("dlpduspec: 0x%x", b:uint()))
-    local dlpduspec = b:uint()
-    pkttree:add(f.dlpduspec_priority, b)
-    pkttree:add(f.dlpduspec_netkey, b)
-    pkttree:add(f.dlpduspec_type, b)
-
-    local priority = band(dlpduspec, 0x30)
-    local netkey = band(dlpduspec, 0x8)
-    local type = band(dlpduspec, 0x7)
-
-    local datalen = buffer:len() - pos - 4
-    local pdu = buffer(pos,datalen)
-    local pduname = pkttype[type] or "UNKNOWN"
-
+    local spec = tvb(0, 1):uint()
+    local pduname = pkttype[bits(spec, 0, 3)] or "unknown"
     pinfo.cols.info = pduname
 
-    subtree:add(f.dlpdudata, pdu)
-    subtree:add(f.mic, buffer(buffer:len() - 4, 4))
+    local subtree = tree:add(wihart, tvb(), "WirelessHART DLPDU")
+    local spectree = subtree:add(f.dlpduspec, tvb(0, 1))
+    spectree:add(f.dlpduspec_priority, tvb(0, 1))
+    spectree:add(f.dlpduspec_netkey, tvb(0, 1))
+    spectree:add(f.dlpduspec_type, tvb(0, 1))
 
-    local function add(tree, field, size)
-        tree:add(field, buffer(pos, size))
-        pos = pos + size
+    local datalen = len - 1 - MIC_LEN
+    if datalen > 0 then
+        subtree:add(f.dlpdudata, tvb(1, datalen))
     end
+    subtree:add(f.mic, tvb(len - MIC_LEN, MIC_LEN))
 
-    if pduname == "data" then
-        local nwktree = tree:add(wihart, pdu, "WiHART NLPDU")
-
-        addrspec = buffer(pos,1):uint()
-        add(nwktree, f.nwk_control, 1)
-
-        --local addrtree = subtree:add(wihart, buffer(1,1), string.format("addrspec: 0x%x", buffer(1,1):uint()))
-        --addrtree:add(f.addrspec_dst64, buffer(1,1))
-        --addrtree:add(f.addrspec_src64, buffer(1,1))
-
-        add(nwktree, f.nwk_ttl, 1)
-        add(nwktree, f.nwk_asn, 2)
-        add(nwktree, f.nwk_graphid, 2)
-
-        doaddr("dst", 0x80, "nwk_", nwktree)
-        doaddr("src", 0x40, "nwk_", nwktree)
+    local pos = 1
+    local function add(t, field, size)
+        local item = t:add(field, tvb(pos, size))
+        pos = pos + size
+        return item
     end
 
     if pduname == "ack" then
-        local acktree = tree:add(wihart, pdu, "WiHART ACK")
+        local acktree = subtree:add(wihart, tvb(1, datalen), "WirelessHART ACK")
         add(acktree, f.ack_code, 1)
         add(acktree, f.ack_timeadj, 2)
-    end
 
-    if pduname == "advertise" then
-        local advtree = tree:add(wihart, pdu, "WiHART ADVERTISE")
-
+    elseif pduname == "advertise" then
+        local advtree = subtree:add(wihart, tvb(1, datalen), "WirelessHART ADVERTISE")
         add(advtree, f.adv_slot, 5)
         add(advtree, f.adv_joinctl, 1)
-        local mapsz = math.ceil(buffer(pos, 1):uint() / 8)
+        local mapsz = math.ceil(tvb(pos, 1):uint() / 8)
         add(advtree, f.adv_mapsz, 1)
         add(advtree, f.adv_map, mapsz)
         add(advtree, f.adv_graphid, 2)
-        local framecnt = buffer(pos, 1):uint()
+        local framecnt = tvb(pos, 1):uint()
         add(advtree, f.adv_framecnt, 1)
-
-        -- I could make these look way better, by using subtrees and setting
-        -- nice strings, but this is good enough for now.
-        while framecnt > 0 do
+        for _ = 1, framecnt do
             add(advtree, f.adv_frameid, 1)
             add(advtree, f.adv_framesz, 2)
-            local linkcnt = buffer(pos, 1):uint()
+            local linkcnt = tvb(pos, 1):uint()
             add(advtree, f.adv_linkcnt, 1)
-            while linkcnt > 0 do
+            for _ = 1, linkcnt do
                 add(advtree, f.adv_linkjoinslot, 2)
                 add(advtree, f.adv_linkjoinbits, 1)
-                linkcnt = linkcnt - 1
             end
-
-            framecnt = framecnt - 1
         end
 
-        assert(pos == buffer:len()-4)
+    elseif pduname == "data" then
+        local nwktree = subtree:add(wihart, tvb(1, datalen), "WirelessHART NPDU")
+        local control = tvb(pos, 1):uint()
+        local ctltree = add(nwktree, f.nwk_control, 1)
+        ctltree:add(f.nwk_control_dst64, tvb(pos - 1, 1))
+        ctltree:add(f.nwk_control_src64, tvb(pos - 1, 1))
+        add(nwktree, f.nwk_ttl, 1)
+        add(nwktree, f.nwk_asn, 2)
+        add(nwktree, f.nwk_graphid, 2)
+        if bits(control, 7, 1) == 1 then
+            add(nwktree, f.nwk_dstaddr64, 8)
+        else
+            add(nwktree, f.nwk_dstaddr, 2)
+        end
+        if bits(control, 6, 1) == 1 then
+            add(nwktree, f.nwk_srcaddr64, 8)
+        else
+            add(nwktree, f.nwk_srcaddr, 2)
+        end
     end
 
+    return len
 end
 
-local wtap_encap = DissectorTable.get("wtap_encap")
--- 223 has now been assigned to DLT, see http://seclists.org/tcpdump/2009/q2/180
--- wtap_encap:add(223,wihart)
--- While 223 is reserved, some changes are needed to wireshark to use it,
--- so we'll use USER0 for now
-wtap_encap:add(wtap.USER0,wihart)
+-- Automatic detection on any 802.15.4 capture. Can be switched off under
+-- Analyze > Enabled Protocols (wihart_wpan).
+wihart:register_heuristic("wpan", function(tvb, pinfo, tree)
+    if not looks_like_wihart(tvb) then return false end
+    wihart.dissector(tvb, pinfo, tree)
+    return true
+end)
 
+-- Manual fallback: Analyze > Decode As... > "IEEE 802.15.4 PANID" > WIHART.
+DissectorTable.get("wpan.panid"):add_for_decode_as(wihart)
