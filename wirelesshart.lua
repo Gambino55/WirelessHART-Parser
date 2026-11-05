@@ -29,6 +29,11 @@ end
 
 local f = wihart.fields
 
+-- The WirelessHART Network ID is carried in the 802.15.4 PAN ID field, which
+-- wpan decodes (shown there in hex). Re-exposed here in decimal, the way
+-- gateways display it.
+local wpan_dst_pan = Field.new("wpan.dst_pan")
+
 local eui64 = { [0] = "no", "yes" }
 local priority = { [0] = "alarm", "normal", "process data", "command" }
 local netkey = { [0] = "false", "true" }
@@ -60,6 +65,7 @@ local function channel_list(tvb, off, n)
     return table.concat(parts, ", ")
 end
 
+f.netid                = ProtoField.uint16("wihart.netid", "Network ID", base.DEC)
 f.dlpduspec            = ProtoField.uint8("wihart.dlpduspec", "DLPDU specifier", base.HEX)
 f.dlpduspec_priority   = ProtoField.uint8("wihart.dlpduspec.priority", "priority", base.HEX, priority, 0x30)
 f.dlpduspec_netkey     = ProtoField.uint8("wihart.dlpduspec.netkey", "network key", base.DEC, netkey, 0x08)
@@ -158,6 +164,11 @@ function wihart.dissector(tvb, pinfo, tree)
     pinfo.cols.info = pduname
 
     local subtree = tree:add(wihart, tvb(), "WirelessHART DLPDU")
+    local pan = wpan_dst_pan()
+    if pan then
+        -- Bytes live in the wpan header, not this payload: add as generated.
+        subtree:add(f.netid, tvb(0, 0), pan.value):set_generated()
+    end
     local spectree = subtree:add(f.dlpduspec, tvb(0, 1))
     spectree:add(f.dlpduspec_priority, tvb(0, 1))
     spectree:add(f.dlpduspec_netkey, tvb(0, 1))
