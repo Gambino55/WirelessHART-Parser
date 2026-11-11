@@ -76,7 +76,7 @@ f.mic                  = ProtoField.uint32("wihart.mic", "message integrity code
 -- advertise
 f.adv_slot             = ProtoField.uint64("wihart.advertise.slot", "absolute slot number", base.DEC)
 f.adv_joinctl          = ProtoField.uint8("wihart.advertise.joinctl", "join control", base.HEX)
-f.adv_mapsz            = ProtoField.uint8("wihart.advertise.chanmapsz", "channel map size", base.DEC)
+f.adv_mapsz            = ProtoField.uint8("wihart.advertise.chanmapsz", "active channels", base.DEC)
 f.adv_map              = ProtoField.bytes("wihart.advertise.chanmap", "channel map")
 f.adv_graphid          = ProtoField.uint16("wihart.advertise.graphid", "graph id", base.HEX)
 f.adv_framecnt         = ProtoField.uint8("wihart.advertise.superframecount", "number of superframes", base.DEC)
@@ -109,15 +109,13 @@ f.nwk_dstaddr64        = ProtoField.uint64("wihart.nwk.dstaddr64", "dstaddr", ba
 f.nwk_srcaddr          = ProtoField.uint16("wihart.nwk.srcaddr", "srcaddr", base.HEX, nickname)
 f.nwk_srcaddr64        = ProtoField.uint64("wihart.nwk.srcaddr64", "srcaddr", base.HEX)
 
--- Length of an advertise body starting at `off`, or nil if it does not fit
--- in `avail` bytes.
-local function advertise_len(tvb, off, avail)
+-- Length of an advertise body starting at `off`, with a channel map of
+-- `mapsz` bytes, or nil if it does not fit in `avail` bytes.
+local function advertise_len(tvb, off, avail, mapsz)
     local p = off
     local function fits(n) return p + n <= off + avail end
     if not fits(7) then return nil end
-    p = p + 6 -- absolute slot number (5) + join control (1)
-    local mapsz = math.ceil(tvb(p, 1):uint() / 8)
-    p = p + 1
+    p = p + 7 -- absolute slot number (5) + join control (1) + active channels (1)
     if not fits(mapsz + 3) then return nil end
     p = p + mapsz + 2 -- channel map + graph id
     local nframes = tvb(p, 1):uint()
@@ -132,6 +130,20 @@ local function advertise_len(tvb, off, avail)
     return p - off
 end
 
+-- Channel map size in bytes for the advertise body at `off`, or nil if the
+-- body does not add up. The byte before the map is the number of ACTIVE
+-- channels (9 with map fc07 = channels 13-21, 15 with ff7f), not a length, so
+-- the map is most likely a fixed 16 bits. Try 2 bytes first, then the older
+-- ceil(count / 8) reading, and keep whichever makes the frame add up.
+local function advertise_mapsz(tvb, off, avail)
+    if avail < 7 then return nil end
+    local count = tvb(off + 6, 1):uint()
+    for _, mapsz in ipairs({ 2, math.ceil(count / 8) }) do
+        if advertise_len(tvb, off, avail, mapsz) == avail then return mapsz end
+    end
+    return nil
+end
+
 -- Structural check used by the heuristic: does this 802.15.4 payload have
 -- the exact shape of a WirelessHART DLPDU?
 local function looks_like_wihart(tvb)
@@ -143,7 +155,7 @@ local function looks_like_wihart(tvb)
     local body = len - 1 - MIC_LEN
     if name == "ack" then return body == 3 end
     if name == "keep alive" or name == "disconnect" then return body == 0 end
-    if name == "advertise" then return advertise_len(tvb, 1, body) == body end
+    if name == "advertise" then return advertise_mapsz(tvb, 1, body) ~= nil end
     if name == "data" then
         if body < NPDU_MIN then return false end
         local control = tvb(1, 1):uint()
@@ -196,7 +208,8 @@ function wihart.dissector(tvb, pinfo, tree)
         local advtree = subtree:add(wihart, tvb(1, datalen), "WirelessHART ADVERTISE")
         add(advtree, f.adv_slot, 5)
         add(advtree, f.adv_joinctl, 1)
-        local mapsz = math.ceil(tvb(pos, 1):uint() / 8)
+        -- Malformed frame (neither size fits): show it with the older rule.
+        local mapsz = advertise_mapsz(tvb, 1, datalen) or math.ceil(tvb(pos, 1):uint() / 8)
         add(advtree, f.adv_mapsz, 1)
         local mapitem = add(advtree, f.adv_map, mapsz)
         if mapsz > 0 then

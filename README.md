@@ -47,7 +47,11 @@ This is a fork that refines earlier work. Credit where it's due:
   on bitwise operators. Removed a crash-prone `assert` and a stray debug `print`.
 - **Advertise channel map** rendered as the list of active channels, not raw hex
   (e.g. `ff7f (channels 11-25)` for a full network, or `fc07 (channels 13-21)`
-  when some channels are blacklisted).
+  when some channels are blacklisted). The byte before the map is the number of
+  active channels (field `wihart.advertise.chanmapsz`, now labelled "active
+  channels"), not a length. The map is read as 2 bytes (falling back to the older
+  ceil(count/8) bytes only if 2 doesn't fit the frame), so networks with 8 or
+  fewer active channels now decode correctly.
 - **Network-layer address nicknames**: 0xF980 → Network Manager, 0xF981 →
   Gateway.
 - **Sample capture** (`hart-test.pcap`) converted from the old custom link type
